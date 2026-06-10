@@ -1,0 +1,21 @@
+{
+  "name": "berg-terminal",
+  "version": "1.0.0",
+  "description": "Free, open-source, keyboard-driven market terminal. Zero dependencies. Independent project — not affiliated with Bloomberg L.P.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tools/smoke.mjs"
+  },
+  "keywords": [
+    "terminal",
+    "finance",
+    "market-data",
+    "stocks",
+    "free",
+    "open-source"
+  ]
+}

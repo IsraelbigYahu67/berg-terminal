@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BERG — free open-source market terminal</title>
+  <meta name="description"
+        content="BERG: a free, open-source, keyboard-driven market terminal. Independent project, not affiliated with Bloomberg L.P." />
+  <link rel="icon" href="data:image/svg+xml,&lt;svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'&gt;&lt;rect width='16' height='16' fill='black'/&gt;&lt;text x='2' y='12' font-family='monospace' font-size='11' fill='%23ff9f0a'&gt;B&lt;/text&gt;&lt;/svg&gt;" />
+  <link rel="stylesheet" href="css/terminal.css" />
+</head>
+<body>
+
+  <!-- boot splash -->
+  <div id="splash">
+    <pre id="splash-logo">
+ ███████   ██████  ███████   ██████
+ ██    ██ ██       ██    ██ ██
+ ███████  █████    ███████  ██  ███
+ ██    ██ ██       ██  ██   ██   ██
+ ███████   ██████  ██   ██   ██████
+    </pre>
+    <div class="splash-sub">OPEN TERMINAL // FREE MARKET DATA WORKSTATION</div>
+    <div class="splash-note">independent open-source software — not affiliated with Bloomberg L.P.</div>
+    <div id="splash-status">INITIALIZING<span class="blink">_</span></div>
+  </div>
+
+  <!-- top bar: command line -->
+  <header id="topbar">
+    <div id="brand">BERG</div>
+    <div id="cmd-wrap">
+      <span id="cmd-prompt">&gt;</span>
+      <input id="cmd" type="text" autocomplete="off" spellcheck="false"
+             placeholder="enter a command, e.g.  AAPL DES   —  type HELP <GO>" />
+      <div id="cmd-suggest" class="hidden"></div>
+    </div>
+    <button id="go-btn" title="execute (Enter)">&lt;GO&gt;</button>
+    <div id="conn-badge" class="badge demo">·····</div>
+  </header>
+
+  <!-- hint strip -->
+  <div id="hintbar">
+    <span class="hint-key">HELP</span><span class="hint-txt">functions</span>
+    <span class="hint-key">Ctrl+1..4</span><span class="hint-txt">panel</span>
+    <span class="hint-key">Ctrl+M</span><span class="hint-txt">zoom panel</span>
+    <span class="hint-key">Esc</span><span class="hint-txt">command line</span>
+    <span id="hint-msg"></span>
+  </div>
+
+  <!-- 4-panel workspace -->
+  <main id="workspace">
+    <section class="panel" id="panel-1">
+      <div class="panel-head"><span class="panel-num">1</span><span class="panel-title">—</span>
+        <button class="panel-zoom" title="zoom">⤢</button></div>
+      <div class="panel-body"></div>
+    </section>
+    <section class="panel" id="panel-2">
+      <div class="panel-head"><span class="panel-num">2</span><span class="panel-title">—</span>
+        <button class="panel-zoom" title="zoom">⤢</button></div>
+      <div class="panel-body"></div>
+    </section>
+    <section class="panel" id="panel-3">
+      <div class="panel-head"><span class="panel-num">3</span><span class="panel-title">—</span>
+        <button class="panel-zoom" title="zoom">⤢</button></div>
+      <div class="panel-body"></div>
+    </section>
+    <section class="panel" id="panel-4">
+      <div class="panel-head"><span class="panel-num">4</span><span class="panel-title">—</span>
+        <button class="panel-zoom" title="zoom">⤢</button></div>
+      <div class="panel-body"></div>
+    </section>
+  </main>
+
+  <!-- scrolling ticker tape -->
+  <div id="tape"><div id="tape-track"></div></div>
+
+  <!-- status bar -->
+  <footer id="statusbar">
+    <span id="clock-ny" class="clock"></span>
+    <span id="clock-ldn" class="clock"></span>
+    <span id="clock-tyo" class="clock"></span>
+    <span class="status-fill"></span>
+    <span id="status-src"></span>
+    <span class="status-note">free &amp; open source · MIT · data delayed/indicative — not investment advice</span>
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
