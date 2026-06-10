@@ -70,20 +70,45 @@ to sort.
 ## Where the data comes from
 
 The bundled server (`server.js`, zero dependencies) proxies and caches
-free public sources, then falls back to deterministic synthetic data when
-a source is unreachable:
+free public sources. Every feed has a **failover chain** — if one source
+is blocked, throttled or down, the next one is tried automatically, and
+only when *every* live source fails does the route fall back to clearly
+labeled synthetic demo data:
 
-| Data              | Source                                        |
-|-------------------|-----------------------------------------------|
-| Quotes & charts   | Yahoo Finance public chart endpoints          |
-| FX reference rates| ECB rates via frankfurter.app                 |
-| Crypto (24h spot) | Binance public ticker API                     |
-| News headlines    | Public RSS feeds (MarketWatch, Yahoo Finance) |
-| Economic calendar | Built-in recurring schedule rules             |
-| Security profiles | Built-in security master (`universe.js`)      |
+| Data              | Provider chain                                              |
+|-------------------|-------------------------------------------------------------|
+| Quotes & charts   | (FMP if key set) → Yahoo Finance (2 hosts, cookie session) → Stooq EOD → demo |
+| FX reference rates| frankfurter.app (ECB) → open.er-api.com → demo              |
+| Crypto (24h spot) | Binance → Coinbase Exchange → demo                          |
+| News headlines    | (FMP if key set) → MarketWatch / Yahoo / CNBC RSS → demo    |
+| Economic calendar | Built-in recurring schedule rules                           |
+| Security profiles | Built-in security master (`universe.js`)                    |
 
-Every screen shows a **LIVE** or **DEMO DATA** tag so you always know what
-you're looking at. Quotes are delayed/indicative — do not trade off them.
+On startup the server **probes every source and prints what it can
+reach**, so if you ever see DEMO data you'll know exactly which feed is
+blocked (also visible at `/api/health`). Every screen shows a **LIVE** or
+**DEMO DATA** tag. Quotes are delayed/indicative — do not trade off them.
+
+### Optional: add a free API key for extra reliability
+
+No key is required, but if you grab a free API key from
+[financialmodelingprep.com](https://site.financialmodelingprep.com/developer/docs)
+the server will use it as the primary source for quotes, charts and news:
+
+```bash
+FMP_API_KEY=your_key_here node server.js        # macOS / Linux
+set FMP_API_KEY=your_key_here && node server.js # Windows (cmd)
+```
+
+### Troubleshooting "DEMO" mode
+
+1. Check the server's startup log — it lists each source as `ok` or `fail`.
+2. Corporate/school networks and some VPNs block finance APIs; try
+   another network.
+3. Binance is geo-blocked in the US — that's fine, Coinbase takes over
+   automatically.
+4. Add an `FMP_API_KEY` (above) for a key-based source that is rarely
+   blocked.
 
 ## Project layout
 

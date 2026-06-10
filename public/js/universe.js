@@ -258,6 +258,7 @@ export const CRYPTO = [
   ["DOT-USD", "Polkadot"],
   ["LINK-USD", "Chainlink"],
   ["LTC-USD", "Litecoin"],
+  ["UNI-USD", "Uniswap"],
 ];
 
 /* ------------------------------------------------------------------ */

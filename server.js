@@ -70,8 +70,8 @@ async function fetchWithTimeout(url, ms = 8000, headers = {}) {
   }
 }
 
-async function fetchJson(url, ms) {
-  const res = await fetchWithTimeout(url, ms);
+async function fetchJson(url, ms, headers) {
+  const res = await fetchWithTimeout(url, ms, headers);
   if (!res.ok) {
     const e = new Error(`upstream ${res.status} for ${url}`);
     e.status = res.status;
@@ -80,9 +80,13 @@ async function fetchJson(url, ms) {
   return res.json();
 }
 
-async function fetchText(url, ms) {
-  const res = await fetchWithTimeout(url, ms);
-  if (!res.ok) throw new Error(`upstream ${res.status} for ${url}`);
+async function fetchText(url, ms, headers) {
+  const res = await fetchWithTimeout(url, ms, headers);
+  if (!res.ok) {
+    const e = new Error(`upstream ${res.status} for ${url}`);
+    e.status = res.status;
+    throw e;
+  }
   return res.text();
 }
 
@@ -354,29 +358,81 @@ function demoFx() {
 /* Live data sources                                                   */
 /* ------------------------------------------------------------------ */
 
-const YH = "https://query1.finance.yahoo.com";
+const YH1 = "https://query1.finance.yahoo.com";
+const YH2 = "https://query2.finance.yahoo.com";
+const FMP_KEY = process.env.FMP_API_KEY || "";
+const FMP = "https://financialmodelingprep.com/api/v3";
 
-async function yahooChart(symbol, range, interval) {
-  const url =
-    `${YH}/v8/finance/chart/${encodeURIComponent(symbol)}` +
-    `?range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}` +
-    `&includePrePost=false&events=div%2Csplit`;
-  const j = await fetchJson(url);
-  const r = j && j.chart && j.chart.result && j.chart.result[0];
-  if (!r) throw new Error(`no chart data for ${symbol}`);
-  return r;
+/* ---- Yahoo (cookie/crumb session to avoid 401/403/429 blocks) ---- */
+
+let ySession = { cookie: "", crumb: "", exp: 0 };
+
+async function yahooSession() {
+  if (ySession.exp > Date.now()) return ySession;
+  let cookie = "";
+  let crumb = "";
+  try {
+    // fc.yahoo.com replies 404 but sets the consent cookie we need
+    const res = await fetchWithTimeout("https://fc.yahoo.com/", 6000);
+    const raw = res.headers.getSetCookie
+      ? res.headers.getSetCookie()
+      : [res.headers.get("set-cookie")].filter(Boolean);
+    cookie = raw.map((c) => c.split(";")[0]).join("; ");
+    if (cookie) {
+      const r2 = await fetchWithTimeout(`${YH1}/v1/test/getcrumb`, 6000, { Cookie: cookie });
+      if (r2.ok) crumb = (await r2.text()).trim();
+    }
+  } catch {
+    /* proceed without a session */
+  }
+  ySession = { cookie, crumb, exp: Date.now() + 20 * 60000 };
+  return ySession;
 }
 
-async function liveQuote(symbol) {
-  const key = `q:${symbol}`;
-  const hit = cacheGet(key);
-  if (hit) return hit;
-  const r = await yahooChart(symbol, "1d", "1d");
+async function yahooChart(symbol, range, interval) {
+  const qs =
+    `?range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}` +
+    `&includePrePost=false&events=div%2Csplit`;
+  const path = `/v8/finance/chart/${encodeURIComponent(symbol)}${qs}`;
+  // plain first, then with a browser-like session on both hosts
+  const attempts = [
+    { host: YH1, sess: false },
+    { host: YH1, sess: true },
+    { host: YH2, sess: true },
+  ];
+  let lastErr;
+  for (const a of attempts) {
+    try {
+      let url = a.host + path;
+      const headers = {};
+      if (a.sess) {
+        const s = await yahooSession();
+        if (s.cookie) headers.Cookie = s.cookie;
+        if (s.crumb) url += `&crumb=${encodeURIComponent(s.crumb)}`;
+      }
+      const j = await fetchJson(url, 8000, headers);
+      const r = j && j.chart && j.chart.result && j.chart.result[0];
+      if (!r) {
+        const e = new Error(`no chart data for ${symbol}`);
+        e.status = 404;
+        throw e;
+      }
+      return r;
+    } catch (e) {
+      lastErr = e;
+      if (e && e.status === 404) throw e; // authoritative: symbol unknown
+      ySession.exp = 0; // force a fresh session on the next attempt
+    }
+  }
+  throw lastErr;
+}
+
+function yahooQuote(r, symbol) {
   const m = r.meta || {};
   const price = m.regularMarketPrice;
   const prevClose = m.chartPreviousClose ?? m.previousClose ?? price;
   if (price == null) throw new Error(`no price for ${symbol}`);
-  const q = {
+  return {
     symbol,
     name: m.longName || m.shortName || symbol,
     price,
@@ -394,37 +450,251 @@ async function liveQuote(symbol) {
     marketState: m.marketState || "",
     time: (m.regularMarketTime || 0) * 1000 || Date.now(),
     source: "live",
+    provider: "yahoo",
   };
-  lastLiveOk = Date.now();
-  cachePut(key, q, 15000);
-  return q;
+}
+
+/* ---- Stooq (free EOD CSV, no key) ---------------------------------- */
+
+const STOOQ_INDEX = {
+  "^GSPC": "^spx", "^DJI": "^dji", "^IXIC": "^ndq",
+  "^FTSE": "^ukx", "^GDAXI": "^dax", "^FCHI": "^cac", "^N225": "^nkx",
+};
+
+function stooqSymbol(sym) {
+  if (STOOQ_INDEX[sym]) return STOOQ_INDEX[sym];
+  if (/^[A-Z]{6}=X$/.test(sym)) return sym.slice(0, 6).toLowerCase(); // EURUSD=X
+  // plain US listings (AAPL, BRK-B). Skip futures/crypto/foreign listings.
+  if (/^[A-Z][A-Z0-9\-]{0,9}$/.test(sym)) return sym.toLowerCase() + ".us";
+  return null;
+}
+
+function ymd(d) {
+  return (
+    d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate()
+  );
+}
+
+/** daily bars (oldest first) from stooq, or throws */
+async function stooqDaily(sym, days, intervalCode = "d") {
+  const ss = stooqSymbol(sym);
+  if (!ss) throw new Error(`stooq: unsupported symbol ${sym}`);
+  const d2 = new Date();
+  const d1 = new Date(Date.now() - days * DAY_MS);
+  const url =
+    `https://stooq.com/q/d/l/?s=${encodeURIComponent(ss)}` +
+    `&i=${intervalCode}&d1=${ymd(d1)}&d2=${ymd(d2)}`;
+  const text = await fetchText(url, 8000);
+  const lines = text.trim().split(/\r?\n/);
+  // header: Date,Open,High,Low,Close,Volume
+  if (lines.length < 2 || !/^Date,/i.test(lines[0])) {
+    throw new Error(`stooq: no data for ${sym}`);
+  }
+  const bars = [];
+  for (let i = 1; i < lines.length; i++) {
+    const [date, o, h, l, c, v] = lines[i].split(",");
+    const close = parseFloat(c);
+    if (!date || !isFinite(close)) continue;
+    bars.push({
+      t: Math.floor(Date.parse(date + "T21:00:00Z") / 1000),
+      o: parseFloat(o),
+      h: parseFloat(h),
+      l: parseFloat(l),
+      c: close,
+      v: parseFloat(v) || 0,
+    });
+  }
+  if (bars.length < 1) throw new Error(`stooq: empty series for ${sym}`);
+  return bars;
+}
+
+async function stooqQuote(symbol) {
+  const bars = await stooqDaily(symbol, 14);
+  const last = bars[bars.length - 1];
+  const prev = bars.length > 1 ? bars[bars.length - 2] : last;
+  return {
+    symbol,
+    name: symbol,
+    price: last.c,
+    prevClose: prev.c,
+    change: round4(last.c - prev.c),
+    changePct: prev.c ? round4(((last.c - prev.c) / prev.c) * 100) : 0,
+    dayHigh: last.h,
+    dayLow: last.l,
+    open: last.o,
+    volume: last.v || null,
+    high52: null,
+    low52: null,
+    currency: "",
+    exchange: "STOOQ EOD",
+    marketState: "CLOSED",
+    time: last.t * 1000,
+    source: "live",
+    provider: "stooq",
+  };
+}
+
+async function stooqHistory(symbol, range, interval) {
+  if (interval.endsWith("m") || interval.endsWith("h")) {
+    throw new Error("stooq: no intraday data");
+  }
+  const code = interval === "1wk" ? "w" : interval === "1mo" ? "m" : "d";
+  const bars = await stooqDaily(symbol, daysInRange(range) + 7, code);
+  return {
+    symbol,
+    range,
+    interval,
+    t: bars.map((b) => b.t),
+    o: bars.map((b) => b.o),
+    h: bars.map((b) => b.h),
+    l: bars.map((b) => b.l),
+    c: bars.map((b) => b.c),
+    v: bars.map((b) => b.v),
+    prevClose: bars.length > 1 ? bars[bars.length - 2].c : null,
+    currency: "",
+    source: "live",
+    provider: "stooq",
+  };
+}
+
+/* ---- Financial Modeling Prep (optional, free API key) -------------- */
+
+async function fmpQuote(symbol) {
+  const j = await fetchJson(
+    `${FMP}/quote/${encodeURIComponent(symbol)}?apikey=${FMP_KEY}`,
+    8000
+  );
+  const x = Array.isArray(j) && j[0];
+  if (!x || x.price == null) throw new Error(`fmp: no quote for ${symbol}`);
+  return {
+    symbol,
+    name: x.name || symbol,
+    price: x.price,
+    prevClose: x.previousClose ?? x.price,
+    change: x.change ?? 0,
+    changePct: x.changesPercentage ?? 0,
+    dayHigh: x.dayHigh ?? null,
+    dayLow: x.dayLow ?? null,
+    open: x.open ?? null,
+    volume: x.volume ?? null,
+    high52: x.yearHigh ?? null,
+    low52: x.yearLow ?? null,
+    currency: "USD",
+    exchange: x.exchange || "",
+    marketState: "",
+    time: (x.timestamp || 0) * 1000 || Date.now(),
+    source: "live",
+    provider: "fmp",
+  };
+}
+
+async function fmpHistory(symbol, range, interval) {
+  const days = daysInRange(range);
+  let rows;
+  if (interval === "5m" || interval === "30m" || interval === "1m") {
+    const gran = interval === "1m" ? "1min" : interval === "5m" ? "5min" : "30min";
+    rows = await fetchJson(
+      `${FMP}/historical-chart/${gran}/${encodeURIComponent(symbol)}?apikey=${FMP_KEY}`,
+      8000
+    );
+    if (!Array.isArray(rows) || !rows.length) throw new Error("fmp: no intraday");
+    const cutoff = Date.now() - days * DAY_MS;
+    rows = rows.filter((r) => Date.parse(r.date) >= cutoff);
+  } else if (interval === "1d") {
+    const from = new Date(Date.now() - days * DAY_MS).toISOString().slice(0, 10);
+    const j = await fetchJson(
+      `${FMP}/historical-price-full/${encodeURIComponent(symbol)}?from=${from}&apikey=${FMP_KEY}`,
+      8000
+    );
+    rows = j && j.historical;
+    if (!Array.isArray(rows) || !rows.length) throw new Error("fmp: no history");
+  } else {
+    throw new Error("fmp: interval not supported"); // 1wk/1mo -> next provider
+  }
+  rows = [...rows].reverse(); // FMP returns newest first
+  return {
+    symbol,
+    range,
+    interval,
+    t: rows.map((r) => Math.floor(Date.parse(r.date) / 1000)),
+    o: rows.map((r) => r.open),
+    h: rows.map((r) => r.high),
+    l: rows.map((r) => r.low),
+    c: rows.map((r) => r.close),
+    v: rows.map((r) => r.volume || 0),
+    prevClose: null,
+    currency: "USD",
+    source: "live",
+    provider: "fmp",
+  };
+}
+
+/* ---- provider chains ------------------------------------------------ */
+
+async function liveQuote(symbol) {
+  const key = `q:${symbol}`;
+  const hit = cacheGet(key);
+  if (hit) return hit;
+  const chain = [];
+  if (FMP_KEY) chain.push(() => fmpQuote(symbol));
+  chain.push(async () => yahooQuote(await yahooChart(symbol, "1d", "1d"), symbol));
+  chain.push(() => stooqQuote(symbol));
+  let lastErr;
+  for (const p of chain) {
+    try {
+      const q = await p();
+      lastLiveOk = Date.now();
+      cachePut(key, q, 15000);
+      return q;
+    } catch (e) {
+      lastErr = e;
+      if (e && e.status === 404) throw e; // symbol genuinely unknown
+    }
+  }
+  throw lastErr || new Error("all quote providers failed");
 }
 
 async function liveHistory(symbol, range, interval) {
   const key = `h:${symbol}:${range}:${interval}`;
   const hit = cacheGet(key);
   if (hit) return hit;
-  const r = await yahooChart(symbol, range, interval);
-  const q = (r.indicators && r.indicators.quote && r.indicators.quote[0]) || {};
-  const t = r.timestamp || [];
-  const out = {
-    symbol,
-    range,
-    interval,
-    t,
-    o: q.open || [],
-    h: q.high || [],
-    l: q.low || [],
-    c: q.close || [],
-    v: q.volume || [],
-    prevClose: (r.meta && (r.meta.chartPreviousClose ?? r.meta.previousClose)) ?? null,
-    currency: (r.meta && r.meta.currency) || "",
-    source: "live",
-  };
-  if (!out.t.length || !out.c.length) throw new Error(`empty history for ${symbol}`);
-  lastLiveOk = Date.now();
-  cachePut(key, out, 60000);
-  return out;
+  const chain = [];
+  if (FMP_KEY) chain.push(() => fmpHistory(symbol, range, interval));
+  chain.push(async () => {
+    const r = await yahooChart(symbol, range, interval);
+    const q = (r.indicators && r.indicators.quote && r.indicators.quote[0]) || {};
+    const out = {
+      symbol,
+      range,
+      interval,
+      t: r.timestamp || [],
+      o: q.open || [],
+      h: q.high || [],
+      l: q.low || [],
+      c: q.close || [],
+      v: q.volume || [],
+      prevClose: (r.meta && (r.meta.chartPreviousClose ?? r.meta.previousClose)) ?? null,
+      currency: (r.meta && r.meta.currency) || "",
+      source: "live",
+      provider: "yahoo",
+    };
+    if (!out.t.length || !out.c.length) throw new Error(`empty history for ${symbol}`);
+    return out;
+  });
+  chain.push(() => stooqHistory(symbol, range, interval));
+  let lastErr;
+  for (const p of chain) {
+    try {
+      const out = await p();
+      lastLiveOk = Date.now();
+      cachePut(key, out, 60000);
+      return out;
+    } catch (e) {
+      lastErr = e;
+      if (e && e.status === 404) throw e;
+    }
+  }
+  throw lastErr || new Error("all history providers failed");
 }
 
 async function liveSearch(qstr) {
@@ -432,9 +702,10 @@ async function liveSearch(qstr) {
   const hit = cacheGet(key);
   if (hit) return hit;
   const url =
-    `${YH}/v1/finance/search?q=${encodeURIComponent(qstr)}` +
+    `${YH1}/v1/finance/search?q=${encodeURIComponent(qstr)}` +
     `&quotesCount=12&newsCount=0&listsCount=0`;
-  const j = await fetchJson(url);
+  const s = await yahooSession();
+  const j = await fetchJson(url, 8000, s.cookie ? { Cookie: s.cookie } : {});
   const items = (j.quotes || [])
     .filter((x) => x.symbol)
     .map((x) => ({
@@ -486,19 +757,42 @@ const GENERAL_FEEDS = [
   ["https://feeds.content.dowjones.io/public/rss/mw_topstories", "MARKETWATCH"],
   ["https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines", "MW REALTIME"],
   ["https://finance.yahoo.com/news/rssindex", "YAHOO FIN"],
+  ["https://www.cnbc.com/id/100003114/device/rss/rss.html", "CNBC"],
+  ["https://www.cnbc.com/id/15839135/device/rss/rss.html", "CNBC MKTS"],
 ];
+
+async function fmpNews(symbol) {
+  const url = symbol
+    ? `${FMP}/stock_news?tickers=${encodeURIComponent(symbol)}&limit=30&apikey=${FMP_KEY}`
+    : `${FMP}/stock_news?limit=40&apikey=${FMP_KEY}`;
+  const j = await fetchJson(url, 8000);
+  if (!Array.isArray(j) || !j.length) throw new Error("fmp: no news");
+  return j.map((x) => ({
+    title: x.title,
+    link: x.url || "",
+    source: (x.site || "FMP").toUpperCase(),
+    time: Date.parse(x.publishedDate) || Date.now(),
+  }));
+}
 
 async function liveNews(symbol) {
   const key = `n:${symbol || "*"}`;
   const hit = cacheGet(key);
   if (hit) return hit;
   let items = [];
-  if (symbol) {
+  if (FMP_KEY) {
+    try {
+      items = await fmpNews(symbol);
+    } catch {
+      /* fall through to the free feeds */
+    }
+  }
+  if (!items.length && symbol) {
     const url =
       `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(symbol)}` +
       `&region=US&lang=en-US`;
     items = parseRss(await fetchText(url), "YAHOO FIN");
-  } else {
+  } else if (!items.length) {
     const results = await Promise.allSettled(
       GENERAL_FEEDS.map(async ([url, name]) => parseRss(await fetchText(url), name))
     );
@@ -514,13 +808,37 @@ async function liveNews(symbol) {
   return out;
 }
 
+async function frankfurterFx(base) {
+  const j = await fetchJson(
+    `https://api.frankfurter.app/latest?from=${encodeURIComponent(base)}`,
+    8000
+  );
+  if (!j || !j.rates) throw new Error("frankfurter: no fx rates");
+  return { base: j.base, date: j.date, rates: j.rates, source: "live", provider: "ecb" };
+}
+
+async function erApiFx(base) {
+  const j = await fetchJson(
+    `https://open.er-api.com/v6/latest/${encodeURIComponent(base)}`,
+    8000
+  );
+  if (!j || j.result !== "success" || !j.rates) throw new Error("er-api: no fx rates");
+  const date = j.time_last_update_unix
+    ? new Date(j.time_last_update_unix * 1000).toISOString().slice(0, 10)
+    : new Date().toISOString().slice(0, 10);
+  return { base, date, rates: j.rates, source: "live", provider: "er-api" };
+}
+
 async function liveFx(base) {
   const key = `fx:${base}`;
   const hit = cacheGet(key);
   if (hit) return hit;
-  const j = await fetchJson(`https://api.frankfurter.app/latest?from=${encodeURIComponent(base)}`);
-  if (!j || !j.rates) throw new Error("no fx rates");
-  const out = { base: j.base, date: j.date, rates: j.rates, source: "live" };
+  let out;
+  try {
+    out = await frankfurterFx(base);
+  } catch {
+    out = await erApiFx(base);
+  }
   lastLiveOk = Date.now();
   cachePut(key, out, 300000);
   return out;
@@ -528,19 +846,21 @@ async function liveFx(base) {
 
 const CRYPTO_PAIRS = [
   "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT",
-  "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT", "MATICUSDT",
+  "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT", "UNIUSDT",
 ];
 
-async function liveCrypto() {
-  const key = "crypto";
-  const hit = cacheGet(key);
-  if (hit) return hit;
+// Coinbase Exchange has no BNB; the rest map 1:1
+const COINBASE_PAIRS = CRYPTO_PAIRS.filter((p) => p !== "BNBUSDT").map((p) =>
+  p.replace(/USDT$/, "-USD")
+);
+
+async function binanceCrypto() {
   const url =
     "https://api.binance.com/api/v3/ticker/24hr?symbols=" +
     encodeURIComponent(JSON.stringify(CRYPTO_PAIRS));
-  const j = await fetchJson(url);
-  if (!Array.isArray(j) || !j.length) throw new Error("no crypto data");
-  const items = j.map((x) => ({
+  const j = await fetchJson(url, 8000);
+  if (!Array.isArray(j) || !j.length) throw new Error("binance: no crypto data");
+  return j.map((x) => ({
     symbol: x.symbol.replace(/USDT$/, "-USD"),
     price: Number(x.lastPrice),
     changePct: Number(x.priceChangePercent),
@@ -548,6 +868,45 @@ async function liveCrypto() {
     low: Number(x.lowPrice),
     volume: Number(x.quoteVolume),
   }));
+}
+
+async function coinbaseCrypto() {
+  const results = await Promise.allSettled(
+    COINBASE_PAIRS.map(async (pair) => {
+      const j = await fetchJson(
+        `https://api.exchange.coinbase.com/products/${pair}/stats`,
+        6000
+      );
+      const last = Number(j.last);
+      const open = Number(j.open);
+      if (!isFinite(last)) throw new Error("bad stats");
+      return {
+        symbol: pair,
+        price: last,
+        changePct: open ? round4(((last - open) / open) * 100) : 0,
+        high: Number(j.high),
+        low: Number(j.low),
+        volume: Number(j.volume) * last, // base volume -> quote (USD) volume
+      };
+    })
+  );
+  const items = results
+    .filter((r) => r.status === "fulfilled")
+    .map((r) => r.value);
+  if (!items.length) throw new Error("coinbase: no crypto data");
+  return items;
+}
+
+async function liveCrypto() {
+  const key = "crypto";
+  const hit = cacheGet(key);
+  if (hit) return hit;
+  let items;
+  try {
+    items = await binanceCrypto(); // geo-blocked for US IPs -> fall through
+  } catch {
+    items = await coinbaseCrypto();
+  }
   const out = { items, source: "live" };
   lastLiveOk = Date.now();
   cachePut(key, out, 15000);
@@ -581,6 +940,8 @@ async function handleApi(req, res, url) {
       return sendJson(res, 200, {
         ok: true,
         liveRecently: Date.now() - lastLiveOk < 10 * 60000,
+        sources: sourceStatus,
+        fmpKeyConfigured: Boolean(FMP_KEY),
         now: Date.now(),
       });
     }
@@ -711,7 +1072,50 @@ const server = http.createServer((req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------ */
+/* Startup self-test: which live sources can this machine reach?       */
+/* ------------------------------------------------------------------ */
+
+const sourceStatus = {};
+
+async function probeSources() {
+  const probes = [
+    ["yahoo (quotes/charts)", async () => yahooChart("AAPL", "1d", "1d")],
+    ["stooq (EOD fallback)", async () => stooqDaily("AAPL", 10)],
+    ["frankfurter (FX)", async () => frankfurterFx("USD")],
+    ["er-api (FX fallback)", async () => erApiFx("USD")],
+    ["binance (crypto)", async () => binanceCrypto()],
+    ["coinbase (crypto fallback)", async () => coinbaseCrypto()],
+    ["news feeds", async () => liveNews(null)],
+  ];
+  if (FMP_KEY) probes.unshift(["fmp (api key)", async () => fmpQuote("AAPL")]);
+
+  console.log("checking live data sources…");
+  await Promise.all(
+    probes.map(async ([name, fn]) => {
+      try {
+        await fn();
+        sourceStatus[name] = "ok";
+        console.log(`  ok    ${name}`);
+      } catch (e) {
+        sourceStatus[name] = `fail (${(e && e.message) || e})`.slice(0, 120);
+        console.log(`  fail  ${name} — ${(e && e.message) || e}`);
+      }
+    })
+  );
+  const okCount = Object.values(sourceStatus).filter((v) => v === "ok").length;
+  if (okCount === 0) {
+    console.log("no live sources reachable — running on synthetic DEMO data");
+  } else {
+    console.log(`${okCount}/${Object.keys(sourceStatus).length} live sources reachable`);
+  }
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`BERG terminal  http://localhost:${PORT}`);
   console.log("free & open source - not affiliated with Bloomberg L.P.");
+  if (!FMP_KEY) {
+    console.log("tip: set FMP_API_KEY=<free key from financialmodelingprep.com> for an extra data source");
+  }
+  probeSources();
 });
